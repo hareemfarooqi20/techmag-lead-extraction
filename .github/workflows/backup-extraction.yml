@@ -1,36 +1,45 @@
-name: Backup Nightly Lead Extraction
+name: All-Day Lead Extraction
 
-# 2026-09-11: secondary/backup extraction source, separate from the primary
-# local Windows Task Scheduler + Docker pipeline (which uses self-hosted
-# Overpass containers and runs 10 PM-7 AM on Hareem's own PC). Lives in this
-# PUBLIC repo specifically so it gets unlimited free GitHub Actions minutes
-# on standard runners (private-repo minutes are metered). This repo holds
+# 2026-09-12: promoted to the PRIMARY extraction source after the local
+# Windows Task Scheduler + Docker pipeline's first unattended run got killed
+# by its own 9-hour execution limit mid-hunt (never reached Bahrain, never
+# reached the email-send step - see automation-system/data/nightly-logs on
+# the private repo). Local Docker extraction is now stopped. This workflow
+# lives in this PUBLIC repo so it gets unlimited free GitHub Actions minutes
+# on standard runners (private-repo minutes are metered) and runs every few
+# hours around the clock instead of one overnight window. This repo holds
 # ONLY extraction code/workflow config - it never contains any lead or
 # business data. Every run:
 #   1. Checks out the PRIVATE techmagsolutions repo using a fine-grained PAT
 #      (PRIVATE_REPO_PAT secret, scoped to Contents: Read/write on that repo
 #      only) into a local folder here in the runner - not into this repo.
-#   2. Runs the PK + GCC Overpass hunts against the PUBLIC Overpass API
-#      (overpass-api.de) - GitHub-hosted runners can't reach the local
-#      Docker containers, so OVERPASS_URL is left unset and both hunt
-#      scripts fall back to the public endpoint automatically.
-#   3. Commits + pushes the updated database.json straight back into the
-#      PRIVATE repo (using the same PAT) - nothing is ever committed here.
+#   2. Runs the PK hunt, then loops the GCC hunt across all 6 countries,
+#      both against the PUBLIC Overpass API (overpass-api.de) - GitHub
+#      runners can't reach the local Docker containers, so OVERPASS_URL is
+#      left unset and both hunt scripts fall back to the public endpoint.
+#   3. Commits + pushes database.json back into the PRIVATE repo IMMEDIATELY
+#      after each segment (PK, then each GCC country) rather than once at
+#      the end - if the job times out or a later segment errors, everything
+#      found before that point is still saved. This is the fix for last
+#      night's local-run data-loss risk (the local script only saved
+#      progress because lowdb writes to disk in real time; a GitHub runner's
+#      checkout is ephemeral until pushed).
 #
-# Sending stays with the private repo's own daily-client-acquisition.yml
-# and the local nightly task; this workflow ONLY extracts.
+# Sending stays entirely with the private repo's own
+# daily-client-acquisition.yml - this workflow ONLY extracts.
 
 on:
   schedule:
-    - cron: '0 20 * * *'  # ~01:00 AM PKT - inside the 10PM-7AM window, offset from the local task's 10PM start so it acts as backup coverage rather than a duplicate run
+    # Every 4 hours, around the clock - replaces the old 10PM-7AM-only window.
+    - cron: '0 0,4,8,12,16,20 * * *'
   workflow_dispatch:
 
 jobs:
-  backup-extraction:
+  extraction:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 340
     concurrency:
-      group: backup-extraction
+      group: lead-extraction
       cancel-in-progress: false
 
     steps:
@@ -54,41 +63,43 @@ jobs:
           PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: 'true'
         run: npm install --production
 
-      - name: Run PK hunt (public Overpass, all cities/niches)
-        working-directory: techmagsolutions/automation-system
-        run: node src/pk-email-hunt.js
-
-      - name: Run GCC hunt (public Overpass, all 6 countries, all niches)
-        working-directory: techmagsolutions/automation-system
-        run: |
-          for c in "Qatar" "Oman" "Saudi Arabia" "UAE" "Kuwait" "Bahrain"; do
-            echo "=== $c ==="
-            HUNT_COUNTRY="$c" node src/intl-osm-hunt.js
-          done
-
       - name: Configure Git
         working-directory: techmagsolutions
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
 
-      - name: Commit and push results to private repo
-        if: always()
+      - name: Extract prospects with incremental commits
         working-directory: techmagsolutions
         run: |
-          if [ -f "automation-system/data/database.json" ]; then
-            git add -f automation-system/data/database.json
-          fi
-          git diff --cached --quiet || {
-            git commit -m "Auto: Update prospect database - $(date -u +'%Y-%m-%d') - Backup extraction run (public repo)"
-            # A failed push MUST fail the job - losing database.json here
-            # would silently drop this run's newly-found prospects.
-            git pull --rebase origin master
-            git push origin HEAD:master
+          set -uo pipefail
+
+          commit_progress() {
+            local label="$1"
+            if [ -f "automation-system/data/database.json" ]; then
+              git add -f automation-system/data/database.json
+            fi
+            if ! git diff --cached --quiet; then
+              git commit -m "Auto: Update prospect database - $(date -u +'%Y-%m-%d %H:%M UTC') - Extraction: $label"
+              git pull --rebase origin master
+              git push origin HEAD:master
+            else
+              echo "No new prospects from $label - nothing to commit."
+            fi
           }
+
+          echo "=== PK hunt ==="
+          (cd automation-system && node src/pk-email-hunt.js) || echo "PK hunt exited non-zero - continuing to commit whatever it found"
+          commit_progress "Pakistan"
+
+          for c in "Qatar" "Oman" "Saudi Arabia" "UAE" "Kuwait" "Bahrain"; do
+            echo "=== $c ==="
+            (cd automation-system && HUNT_COUNTRY="$c" node src/intl-osm-hunt.js) || echo "$c hunt exited non-zero - continuing to commit whatever it found"
+            commit_progress "$c"
+          done
 
       - name: Log failure
         if: failure()
         run: |
-          echo "Backup extraction failed. Check workflow logs."
+          echo "Extraction workflow failed. Check the step logs above."
           echo "Ensure PRIVATE_REPO_PAT secret is set and has Contents: Read/write on hareemfarooqi20/techmagsolutions."
