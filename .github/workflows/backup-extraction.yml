@@ -68,6 +68,12 @@ jobs:
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
+          # 2026-10-01: a fresh runner checkout never has the union merge driver registered (it's
+          # per-clone git config; .gitattributes alone doesn't activate it) - every plain `git pull
+          # --rebase` that landed on a database.json changed on both sides failed outright instead of
+          # combining them, about 1 in 3 runs, spamming failure emails. Same fix
+          # daily-client-acquisition.yml already uses.
+          bash automation-system/scripts/install-db-merge-driver.sh
 
       - name: Extract prospects with incremental commits
         working-directory: techmagsolutions
@@ -81,8 +87,16 @@ jobs:
             fi
             if ! git diff --cached --quiet; then
               git commit -m "Auto: Update prospect database - $(date -u +'%Y-%m-%d %H:%M UTC') - Extraction: $label"
-              git pull --rebase origin master
-              git push origin HEAD:master
+              pushed=0
+              for attempt in 1 2 3 4 5; do
+                if git pull --rebase origin master && git push origin HEAD:master; then pushed=1; break; fi
+                echo "push attempt $attempt failed for $label - aborting any half-done rebase and retrying"
+                git rebase --abort 2>/dev/null || true
+                sleep $((attempt * 15))
+              done
+              if [ "$pushed" != "1" ]; then
+                echo "::warning::Could not push $label after 5 attempts - its results stay only in this runner and are lost when it's cleaned up"
+              fi
             else
               echo "No new prospects from $label - nothing to commit."
             fi
